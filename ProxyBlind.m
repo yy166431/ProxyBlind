@@ -1,124 +1,147 @@
-// ProxyBlind.m
-// 目标：让 App 感知不到代理；放过证书校验以便中间人抓包。
-// 依赖：fishhook （把 fishhook.c / fishhook.h 放同目录）
+// ProxyBlind.m  —  无日志，只在安装时弹窗一次“已生效”
+// 需要同目录 fishhook.c / fishhook.h
 
 #import <Foundation/Foundation.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
-#import <dlfcn.h>
+#import <UIKit/UIKit.h>
 #import "fishhook.h"
+
+#pragma mark - 弹窗（只弹一次）
+
+static void PopupOnce(NSString *title, NSString *msg) {
+    static BOOL shown = NO;
+    if (shown) return;
+    shown = YES;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:title
+                                                                   message:msg
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
+        UIWindow *win = UIApplication.sharedApplication.keyWindow ?: UIApplication.sharedApplication.windows.firstObject;
+        UIViewController *vc = win.rootViewController;
+        while (vc.presentedViewController) vc = vc.presentedViewController;
+        [vc presentViewController:a animated:YES completion:nil];
+    });
+}
 
 #pragma mark - 工具
 
-static CFDictionaryRef CFDictRetainBridge(NSDictionary *d) {
+static CFDictionaryRef CFRetainBridge(NSDictionary *d) {
     return (CFDictionaryRef)CFRetain((__bridge CFTypeRef)(d ?: @{}));
 }
 static NSDictionary *EmptyProxyDict(void) {
     return @{
-        (__bridge NSString *)kCFNetworkProxiesHTTPEnable: @0,
+        (__bridge NSString *)kCFNetworkProxiesHTTPEnable:  @0,
         (__bridge NSString *)kCFNetworkProxiesHTTPSEnable: @0,
         (__bridge NSString *)kCFNetworkProxiesSOCKSEnable: @0,
     };
 }
 
-#pragma mark - ① 伪装：系统“无代理”
+#pragma mark - ① CFNetwork：系统级代理清空
 
-// CFNetworkCopySystemProxySettings -> 返回“无代理”
 typedef CFDictionaryRef (*PFN_CFNetworkCopySystemProxySettings)(void);
-static PFN_CFNetworkCopySystemProxySettings orig_CFNetworkCopySystemProxySettings = NULL;
+static PFN_CFNetworkCopySystemProxySettings orig_CFNetworkCopySystemProxySettings;
 static CFDictionaryRef fake_CFNetworkCopySystemProxySettings(void) {
-    return CFDictRetainBridge(EmptyProxyDict());
+    return CFRetainBridge(EmptyProxyDict());
 }
 
-// 额外覆盖：SCDynamicStoreCopyProxies / CFNetworkCopyProxiesForURL
-typedef CFDictionaryRef (*PFN_SCDynamicStoreCopyProxies)(void *);
-static PFN_SCDynamicStoreCopyProxies orig_SCDynamicStoreCopyProxies = NULL;
+typedef CFDictionaryRef (*PFN_SCDynamicStoreCopyProxies)(void *store);
+static PFN_SCDynamicStoreCopyProxies orig_SCDynamicStoreCopyProxies;
 static CFDictionaryRef fake_SCDynamicStoreCopyProxies(void *store) {
-    return CFDictRetainBridge(EmptyProxyDict());
+    return CFRetainBridge(EmptyProxyDict());
 }
 
 typedef CFArrayRef (*PFN_CFNetworkCopyProxiesForURL)(CFURLRef, CFDictionaryRef);
-static PFN_CFNetworkCopyProxiesForURL orig_CFNetworkCopyProxiesForURL = NULL;
-static CFArrayRef fake_CFNetworkCopyProxiesForURL(CFURLRef url, CFDictionaryRef proxySettings) {
-    // 返回空数组：表示“没有可用代理”
-    CFArrayRef empty = CFArrayCreate(kCFAllocatorDefault, NULL, 0, &kCFTypeArrayCallBacks);
-    return empty;
+static PFN_CFNetworkCopyProxiesForURL orig_CFNetworkCopyProxiesForURL;
+static CFArrayRef fake_CFNetworkCopyProxiesForURL(CFURLRef url, CFDictionaryRef settings) {
+    return CFArrayCreate(kCFAllocatorDefault, NULL, 0, &kCFTypeArrayCallBacks);
 }
 
-// getenv("http_proxy"/"https_proxy"/"all_proxy") -> NULL
-static char *(*orig_getenv)(const char *) = NULL;
+#pragma mark - ② 环境变量：getenv 系
+
+static char *(*orig_getenv)(const char *name);
 static char *fake_getenv(const char *name) {
-    if (name) {
-        if (!strcasecmp(name, "http_proxy") ||
-            !strcasecmp(name, "https_proxy") ||
-            !strcasecmp(name, "all_proxy")  ||
-            !strcasecmp(name, "HTTP_PROXY") ||
-            !strcasecmp(name, "HTTPS_PROXY")||
-            !strcasecmp(name, "ALL_PROXY")) {
-            return NULL;
-        }
+    if (!name) return NULL;
+    if (!strncasecmp(name, "http_proxy", 10) ||
+        !strncasecmp(name, "https_proxy",11) ||
+        !strncasecmp(name, "all_proxy",  9) ||
+        !strncasecmp(name, "HTTP_PROXY",10) ||
+        !strncasecmp(name, "HTTPS_PROXY",11) ||
+        !strncasecmp(name, "ALL_PROXY",  9)) {
+        return NULL;
     }
-    return orig_getenv ? orig_getenv(name) : NULL;
+    return orig_getenv(name);
 }
 
-#pragma mark - ② 放过 HTTPS 证书校验（Pinning 绕过）
+#pragma mark - ③ 会话级：NSURLSessionConfiguration
 
-// iOS 13+ 新接口
-typedef bool (*PFN_SecTrustEvaluateWithError)(SecTrustRef, CFErrorRef *);
-static PFN_SecTrustEvaluateWithError orig_SecTrustEvaluateWithError = NULL;
-static bool fake_SecTrustEvaluateWithError(SecTrustRef trust, CFErrorRef *error) {
-    return true; // 直接通过
+static NSURLSessionConfiguration* (*orig_defCfg)(id, SEL);
+static NSURLSessionConfiguration* (*orig_ephCfg)(id, SEL);
+
+static NSURLSessionConfiguration* sanitizeCfg(NSURLSessionConfiguration *cfg) {
+    if (!cfg) return cfg;
+    // 清空代理字典
+    cfg.connectionProxyDictionary = @{};
+    // 兼容某些私有字段
+    @try { [cfg setValue:EmptyProxyDict() forKey:@"_connectionProxyDictionary"]; } @catch (...) {}
+    return cfg;
+}
+static NSURLSessionConfiguration* swz_defCfg(id self, SEL _cmd) {
+    return sanitizeCfg(orig_defCfg(self, _cmd));
+}
+static NSURLSessionConfiguration* swz_ephCfg(id self, SEL _cmd) {
+    return sanitizeCfg(orig_ephCfg(self, _cmd));
 }
 
-// 旧接口（某些三方库仍调用）
-typedef OSStatus (*PFN_SecTrustEvaluate)(SecTrustRef, SecTrustResultType *);
-static PFN_SecTrustEvaluate orig_SecTrustEvaluate = NULL;
-static OSStatus fake_SecTrustEvaluate(SecTrustRef trust, SecTrustResultType *result) {
-    if (result) *result = kSecTrustResultProceed;
-    return errSecSuccess;
-}
+#pragma mark - ④ 兜底：CFStream 属性级
 
-// 兜底：NSURLSession challenge → 直接使用凭据
-static void (*orig_NSURLSession_delegate_challenge)(id, SEL, NSURLSession*, NSURLAuthenticationChallenge*, void(^)(NSURLSessionAuthChallengeDisposition, NSURLCredential*)) = NULL;
+typedef CFTypeRef (*PFN_CFReadStreamCopyProperty)(CFReadStreamRef, CFStringRef);
+static PFN_CFReadStreamCopyProperty orig_CFReadStreamCopyProperty;
 
-static void swz_NSURLSession_delegate_challenge(id self, SEL _cmd,
-                                                NSURLSession *session,
-                                                NSURLAuthenticationChallenge *challenge,
-                                                void (^completionHandler)(NSURLSessionAuthChallengeDisposition, NSURLCredential *)) {
-    SecTrustRef trust = challenge.protectionSpace.serverTrust;
-    if (trust && completionHandler) {
-        NSURLCredential *cred = [NSURLCredential credentialForTrust:trust];
-        completionHandler(NSURLSessionAuthChallengeUseCredential, cred);
-        return;
+static CFTypeRef fake_CFReadStreamCopyProperty(CFReadStreamRef stream, CFStringRef propName) {
+    if (propName == kCFStreamPropertyHTTPProxy ||
+        propName == kCFStreamPropertySOCKSProxy ||
+        CFEqual(propName, CFSTR("kCFStreamPropertyHTTPSProxy"))) {
+        return CFRetainBridge(EmptyProxyDict());
     }
-    if (orig_NSURLSession_delegate_challenge) {
-        orig_NSURLSession_delegate_challenge(self, _cmd, session, challenge, completionHandler);
-    }
+    return orig_CFReadStreamCopyProperty ? orig_CFReadStreamCopyProperty(stream, propName) : NULL;
 }
 
-#pragma mark - 安装
+#pragma mark - 安装 Hook
 
 __attribute__((constructor))
-static void _proxyblind_init(void) {
+static void _proxy_blind_init(void) {
     @autoreleasepool {
-        // fishhook 绑定
-        struct rebinding rbs[] = {
+        // ① CFNetwork 钩子
+        rebind_symbols((struct rebinding[3]){
             {"CFNetworkCopySystemProxySettings", (void *)fake_CFNetworkCopySystemProxySettings, (void **)&orig_CFNetworkCopySystemProxySettings},
-            {"SCDynamicStoreCopyProxies",        (void *)fake_SCDynamicStoreCopyProxies,        (void **)&orig_SCDynamicStoreCopyProxies},
-            {"CFNetworkCopyProxiesForURL",       (void *)fake_CFNetworkCopyProxiesForURL,       (void **)&orig_CFNetworkCopyProxiesForURL},
-            {"getenv",                            (void *)fake_getenv,                           (void **)&orig_getenv},
-            {"SecTrustEvaluateWithError",         (void *)fake_SecTrustEvaluateWithError,        (void **)&orig_SecTrustEvaluateWithError},
-            {"SecTrustEvaluate",                  (void *)fake_SecTrustEvaluate,                 (void **)&orig_SecTrustEvaluate},
-        };
-        rebind_symbols(rbs, sizeof(rbs)/sizeof(rbs[0]));
+            {"SCDynamicStoreCopyProxies",       (void *)fake_SCDynamicStoreCopyProxies,       (void **)&orig_SCDynamicStoreCopyProxies},
+            {"CFNetworkCopyProxiesForURL",      (void *)fake_CFNetworkCopyProxiesForURL,      (void **)&orig_CFNetworkCopyProxiesForURL},
+        }, 3);
 
-        // swizzle NSURLSession 的 challenge 兜底（有些库走 delegate）
-        Class cls = NSClassFromString(@"NSURLSession");
-        SEL sel = NSSelectorFromString(@"URLSession:didReceiveChallenge:completionHandler:");
-        Method m = cls ? class_getInstanceMethod(cls, sel) : NULL;
-        if (m) {
-            orig_NSURLSession_delegate_challenge = (void *)method_getImplementation(m);
-            method_setImplementation(m, (IMP)swz_NSURLSession_delegate_challenge);
+        // ② 环境变量
+        rebind_symbols((struct rebinding[1]){
+            {"getenv", (void *)fake_getenv, (void **)&orig_getenv},
+        }, 1);
+
+        // ③ NSURLSessionConfiguration
+        Class Cfg = NSURLSessionConfiguration.class;
+        if (Cfg) {
+            Method m1 = class_getClassMethod(Cfg, @selector(defaultSessionConfiguration));
+            if (m1) { orig_defCfg = (void *)method_getImplementation(m1);
+                      method_setImplementation(m1, (IMP)swz_defCfg); }
+            Method m2 = class_getClassMethod(Cfg, @selector(ephemeralSessionConfiguration));
+            if (m2) { orig_ephCfg = (void *)method_getImplementation(m2);
+                      method_setImplementation(m2, (IMP)swz_ephCfg); }
         }
+
+        // ④ CFStream 兜底
+        rebind_symbols((struct rebinding[1]){
+            {"CFReadStreamCopyProperty", (void *)fake_CFReadStreamCopyProperty, (void **)&orig_CFReadStreamCopyProperty},
+        }, 1);
+
+        // 只弹一次
+        PopupOnce(@"ProxyBlind 已生效", @"已隐藏系统/会话/环境变量的代理设置。");
     }
 }
