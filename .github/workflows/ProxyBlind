@@ -1,0 +1,27 @@
+name: Build AliSniffer dylib
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show SDKs
+        run: xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Build with Makefile
+        run: |
+          make clean
+          make
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ProxyBlind
+          path: ProxyBlind.dylib
