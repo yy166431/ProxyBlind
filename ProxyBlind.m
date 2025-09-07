@@ -8,6 +8,7 @@
 //
 
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>                       // ✅ 修复：需要 UIKit 才能弹窗
 #import <CoreFoundation/CoreFoundation.h>
 #import <SystemConfiguration/SystemConfiguration.h>
 #import <Security/Security.h>
@@ -21,8 +22,6 @@ static CFDictionaryRef CFRetainBridge(NSDictionary *d) {
 
 // 空代理字典：全部“未启用”
 static NSDictionary *PB_EmptyProxyDictObj(void) {
-    // 不直接引用 kCFNetworkProxies* 常量，避免在 iOS SDK 上出现“不可用”编译错误；
-    // 以 NSString 写入同名 key 即可满足调用方读取。
     return @{
         (__bridge NSString *)kCFNetworkProxiesHTTPEnable  : @0,
         (__bridge NSString *)kCFNetworkProxiesHTTPSEnable : @0,
@@ -39,21 +38,27 @@ static CFArrayRef PB_EmptyProxyArray(void) {
     return CFArrayCreate(kCFAllocatorDefault, NULL, 0, &callbacks);
 }
 
-// 只弹一次的小提示
+// 只弹一次的小提示（若无法拿到窗口则静默）
 static void PB_ShowOnce(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         dispatch_async(dispatch_get_main_queue(), ^{
-            NSString *title = @"ProxyBlind 已启用";
-            NSString *msg   = @"已将系统/会话/脚本/环境变量/流级代理统一伪装为“无代理”。";
-            UIAlertController *ac = [UIAlertController alertControllerWithTitle:title
-                                                                        message:msg
-                                                                 preferredStyle:UIAlertControllerStyleAlert];
-            [ac addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
-            UIWindow *win = UIApplication.sharedApplication.keyWindow ?: UIApplication.sharedApplication.windows.firstObject;
-            UIViewController *vc = win.rootViewController;
-            while (vc.presentedViewController) { vc = vc.presentedViewController; }
-            [vc presentViewController:ac animated:YES completion:nil];
+            if (@available(iOS 9.0, *)) {
+                UIApplication *app = UIApplication.sharedApplication;
+                if (!app) return;
+                UIWindow *win = app.keyWindow ?: app.windows.firstObject;
+                if (!win) return;
+                UIViewController *vc = win.rootViewController;
+                if (!vc) return;
+                while (vc.presentedViewController) { vc = vc.presentedViewController; }
+
+                UIAlertController *ac =
+                [UIAlertController alertControllerWithTitle:@"ProxyBlind 已启用"
+                                                    message:@"已将系统/会话/脚本/环境变量/流级代理统一伪装为“无代理”。"
+                                             preferredStyle:UIAlertControllerStyleAlert];
+                [ac addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
+                [vc presentViewController:ac animated:YES completion:nil];
+            }
         });
     });
 }
