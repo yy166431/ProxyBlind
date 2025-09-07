@@ -1,25 +1,29 @@
-# Makefile - build ProxyBlind.dylib
-TARGET  ?= iphoneos
-ARCHS   ?= arm64
-SDKROOT := $(shell xcrun --sdk $(TARGET) --show-sdk-path 2>/dev/null)
-CC      := $(shell xcrun --sdk $(TARGET) -f clang)
+name: Build ProxyBlind dylib
 
-CFLAGS  := -fPIC -O2 -Wall -Wno-objc-method-access -Wno-implicit-function-declaration \
-           -isysroot $(SDKROOT) -miphoneos-version-min=12.0 -arch $(ARCHS) -fobjc-arc
-LDFLAGS := -dynamiclib -isysroot $(SDKROOT) -arch $(ARCHS) -framework Foundation -framework Security
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
 
-OBJS := ProxyBlind.o fishhook.o
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
 
-all: ProxyBlind.dylib
+      - name: Show SDKs
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
 
-ProxyBlind.o: ProxyBlind.m
-	$(CC) $(CFLAGS) -c $< -o $@
+      - name: Build
+        run: |
+          make clean
+          make TARGET=iphoneos ARCHS=arm64
 
-fishhook.o: fishhook.c fishhook.h
-	$(CC) -fPIC -O2 -isysroot $(SDKROOT) -arch $(ARCHS) -c fishhook.c -o $@
-
-ProxyBlind.dylib: $(OBJS)
-	$(CC) $(LDFLAGS) -o $@ $(OBJS)
-
-clean:
-	rm -f $(OBJS) ProxyBlind.dylib
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ProxyBlind
+          path: ProxyBlind.dylib
